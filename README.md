@@ -250,7 +250,7 @@ Aqui a skill manteve `models/` e `routes/` com os mesmos nomes, adicionou `contr
 | Relatório segue o template | ✅ | ✅ | ✅ |
 | Cada finding tem arquivo e linhas exatos | ✅ | ✅ | ✅ |
 | Findings ordenados CRITICAL → LOW | ✅ | ✅ | ✅ |
-| Mínimo de 5 findings | ✅ 20 | ✅ 19 | ✅ 18 |
+| Mínimo de 5 findings | ✅ 20 | ✅ 19 | ✅ 24 |
 | Detecção de APIs deprecated incluída | ✅ seção presente, "nenhuma" | ✅ driver callback-only | ✅ 3 APIs |
 | Pausa e pede confirmação antes da Fase 3 | ✅ | ✅ | ✅ |
 | **Fase 3** | | | |

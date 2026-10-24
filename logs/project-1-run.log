@@ -1,0 +1,988 @@
+RUN LOG - refactor-arch - code-smells-project
+Data: 2026-10-03
+
+================================
+PHASE 1: PROJECT ANALYSIS
+================================
+Language:      Python 3 (sintaxe compatível com 3.9+)
+Framework:     Flask 3.1.1 (flask-cors 5.0.1)
+Dependencies:  flask==3.1.1, flask-cors==5.0.1, sqlite3 (stdlib)
+Domain:        API de e-commerce (produtos, usuários, pedidos, itens de pedido), com autenticação por login e relatório de vendas
+Architecture:  Módulos planos (app.py / controllers.py / models.py / database.py) que cruzam camadas: rotas administrativas acessam o banco diretamente em app.py, controllers.py mistura validação, orquestração e regras de negócio, e models.py mistura SQL com regra de negócio (verificação de estoque, cálculo de total)
+Source files:  4 files analyzed (~780 linhas)
+DB tables:     produtos, usuarios, pedidos, itens_pedido (sem foreign keys declaradas)
+Entry point:   app.py (app.run(host="0.0.0.0", port=5000, debug=True))
+Endpoints:     19 routes mapped
+================================
+
+================================
+Phase 2 complete. Proceed with refactoring (Phase 3)? [y/n]
+================================
+Resposta recebida: y
+
+--- Relatório completo da Fase 2 (reports/audit-project-1.md) ---
+
+================================
+ARCHITECTURE AUDIT REPORT
+================================
+Project: code-smells-project
+Stack:   Python 3.12 + Flask 3.1.1
+Files:   4 analyzed | ~780 lines of code
+Date:    2026-10-03
+
+## Summary
+CRITICAL: 6 | HIGH: 5 | MEDIUM: 5 | LOW: 4
+
+## Findings
+
+### #1 [CRITICAL] God file / God class (AP-03)
+File: models.py:1-315 (especialmente 133-169, 235-273)
+Description: models.py concentra acesso a dados via SQL cru e regras de negócio para quatro entidades (produtos, usuarios, pedidos, itens_pedido) no mesmo arquivo: criar_pedido (133-169) valida estoque, calcula total e grava pedido/itens/baixa de estoque; relatorio_vendas (235-273) calcula desconto e ticket médio. Nenhuma dessas responsabilidades está isolada em uma camada própria.
+Impact: Nenhuma regra pode ser testada isoladamente do SQLite; qualquer mudança em uma entidade arrisca quebrar outra; o arquivo já passa de 300 linhas misturando camadas.
+Recommendation: Dividir por entidade e por camada (um módulo de modelo por agregado, controllers separados). Ver RP-03.
+
+### #2 [CRITICAL] Unprotected dangerous endpoint (AP-06)
+File: app.py:47-57, 59-78
+Description: POST /admin/reset-db (app.py:47-57) apaga todas as linhas de itens_pedido, pedidos, produtos e usuarios sem nenhuma verificação de autenticação. POST /admin/query (app.py:59-78) recebe uma string SQL arbitrária do corpo da requisição (dados.get("sql")) e executa diretamente com cursor.execute(query), sem autenticação nem validação.
+Impact: Qualquer pessoa que alcance o host destrói a base inteira ou executa qualquer comando SQL (leitura, escrita ou exclusão) sem autorização alguma — é o pior risco do projeto.
+Recommendation: Remover a execução de SQL arbitrário do contrato e proteger operações administrativas destrutivas com um guard de autenticação vindo da config. Ver RP-13.
+
+### #3 [CRITICAL] SQL injection (string-built queries) (AP-02)
+File: models.py:28, 48-50, 57-61, 68, 92, 109-111, 126-129, 140, 148-151, 155, 157-161, 163-166, 174, 188, 192, 220, 224, 279-281, 291-297
+Description: Praticamente toda consulta em models.py é montada concatenando strings com valores vindos diretamente da requisição (str(id), nome, descricao, categoria, email, senha, termo de busca etc.), incluindo a consulta de login (109-111: "... WHERE email = '" + email + "' AND senha = '" + senha + "'").
+Impact: Permite bypass de login (ex.: email' OR '1'='1), exfiltração ou destruição de dados e quebra de tipos (um preço como string vai direto para o SQL).
+Recommendation: Trocar toda concatenação por queries parametrizadas (?) do próprio sqlite3. Ver RP-02.
+
+### #4 [CRITICAL] Plaintext or weak password storage (AP-05)
+File: models.py:105-120, 122-131; database.py:75-79
+Description: login_usuario (models.py:105-120) compara a senha recebida diretamente com o valor salvo no banco; criar_usuario (122-131) insere a senha exatamente como recebida, sem hash; os usuários de seed em database.py:75-79 já nascem com senhas em texto puro ("admin123", "123456", "senha123").
+Impact: Um vazamento do arquivo loja.db expõe a senha real de todos os usuários; não há como revogar ou auditar.
+Recommendation: Aplicar hash (werkzeug.security.generate_password_hash / check_password_hash, já disponível via Flask) na criação e no login. Ver RP-09.
+
+### #5 [CRITICAL] Hardcoded credentials and secrets (AP-01)
+File: app.py:7
+Description: app.config["SECRET_KEY"] = "minha-chave-super-secreta-123" está escrita diretamente no código-fonte.
+Impact: Qualquer pessoa com acesso ao repositório tem a chave de sessão/assinatura da aplicação; trocar a chave exige um deploy manual do código.
+Recommendation: Ler a chave de uma variável de ambiente com valor seguro apenas para desenvolvimento local. Ver RP-01.
+
+### #6 [CRITICAL] Sensitive data exposure in responses or logs (AP-04)
+File: models.py:72-87 (campo "senha" na linha 83), models.py:89-103 (campo "senha" na linha 99); controllers.py:264-292 (secret_key na linha 289, debug na linha 288)
+Description: get_todos_usuarios e get_usuario_por_id devolvem o campo "senha" para qualquer chamador de GET /usuarios e GET /usuarios/<id>; health_check devolve secret_key, debug e db_path no corpo de uma resposta pública.
+Impact: Vaza credenciais e informações internas da infraestrutura (chave de assinatura, caminho do banco, modo debug) para qualquer cliente da API.
+Recommendation: Serializar usuário com uma whitelist de campos (sem senha) e remover dados sensíveis do /health. Ver RP-09.
+
+### #7 [HIGH] Tight coupling / no dependency injection (AP-09)
+File: controllers.py:1-3; app.py:4, 49, 66
+Description: controllers.py importa diretamente database.get_db (linha 3) e models; app.py também importa get_db e o usa diretamente dentro das rotas /admin/reset-db (linha 49) e /admin/query (linha 66), pulando completamente a camada de controller/model.
+Impact: Nenhuma dessas rotas pode ser testada sem um SQLite real; trocar o armazenamento ou isolar um teste exige editar cada consumidor.
+Recommendation: Centralizar o acesso a dados nos models e compor a aplicação a partir de um composition root único. Ver RP-05.
+
+### #8 [HIGH] Global mutable state (AP-08)
+File: database.py:4, 8-10
+Description: db_connection é uma variável global de módulo (linha 4), reatribuída dentro de get_db via global db_connection (linha 8) e conectada com check_same_thread=False (linha 10) para contornar o fato de ser uma conexão única compartilhada entre requisições.
+Impact: Acoplamento oculto entre requisições concorrentes, condições de corrida em escrita e impossibilidade de isolar testes com uma conexão própria.
+Recommendation: Escopar a conexão por requisição/injeção em vez de um singleton de módulo. Ver RP-05.
+
+### #9 [HIGH] Business logic inside route handlers (fat controllers) (AP-07)
+File: controllers.py:24-62, 64-96, 188-220
+Description: criar_produto, atualizar_produto e criar_pedido validam entrada, aplicam regras (lista de categorias válidas, cálculo de total) e chamam o acesso a dados, tudo na mesma função de mais de 30 linhas.
+Impact: As regras só existem atreladas ao HTTP, não podem ser reaproveitadas por um job ou CLI, e cada handler reimplementa validação de forma ligeiramente diferente.
+Recommendation: Extrair validação e orquestração para um controller fino que delega a um model/serviço. Ver RP-04 e RP-16.
+
+### #10 [HIGH] Missing transaction and data integrity (AP-12)
+File: models.py:133-169; database.py:15-53
+Description: criar_pedido (133-169) faz múltiplos INSERT/UPDATE (pedido, itens, baixa de estoque) com um único commit no final, sem BEGIN/transação explícita nem rollback em caso de falha parcial; o schema em database.py (15-53) não declara nenhuma foreign key nem UNIQUE (ex.: usuarios.email sem UNIQUE, itens_pedido.pedido_id sem FK para pedidos).
+Impact: Uma falha no meio do fluxo deixa pedido criado sem itens ou estoque baixado sem pedido associado; e-mails duplicados e registros órfãos corrompem relatórios.
+Recommendation: Envolver a sequência em uma transação e declarar as constraints que o domínio exige. Ver RP-14.
+
+### #11 [HIGH] Insecure runtime defaults (AP-11)
+File: app.py:8, 9, 88
+Description: app.config["DEBUG"] = True (linha 8), CORS(app) sem restrição de origem (linha 9) e app.run(host="0.0.0.0", port=5000, debug=True) (linha 88) expõem o debugger do Werkzeug publicamente e liberam qualquer origem via CORS.
+Impact: O debugger do Werkzeug com debug=True permite execução remota de código; CORS aberto facilita ataques de origem cruzada.
+Recommendation: Ler debug, host, porta e origens permitidas da configuração, desligados por padrão fora do ambiente local. Ver RP-01.
+
+### #12 [MEDIUM] N+1 queries (AP-13)
+File: models.py:187-199, 219-231
+Description: get_pedidos_usuario e get_todos_pedidos abrem um cursor2 para buscar itens_pedido por pedido e, dentro desse laço, abrem um cursor3 para buscar o nome do produto por item — uma consulta por pedido mais uma por item.
+Impact: O tempo de resposta cresce linearmente com o número de pedidos e itens; o banco é acionado dezenas de vezes para montar uma única resposta.
+Recommendation: Substituir por JOINs entre pedidos, itens_pedido e produtos. Ver RP-08.
+
+### #13 [MEDIUM] Duplicated code (AP-14)
+File: models.py:9-21 e 302-313; models.py:176-199 e 211-231; controllers.py:28-46 e 72-90
+Description: get_todos_produtos e buscar_produtos repetem o mesmo bloco de serialização linha a linha; get_pedidos_usuario e get_todos_pedidos repetem a mesma montagem de itens por pedido; criar_produto e atualizar_produto repetem a mesma cadeia de validação de nome/preço/estoque.
+Impact: Qualquer correção de regra ou de serialização precisa ser replicada em vários lugares, e as cópias já divergem (atualizar_produto não repete a checagem de tamanho do nome que criar_produto tem).
+Recommendation: Extrair um serializador de produto/pedido e um validador reutilizável. Ver RP-15.
+
+### #14 [MEDIUM] Missing or inconsistent input validation (AP-15)
+File: controllers.py:43-46, 87-90, 118-121
+Description: preco e estoque são comparados com < 0 sem checar o tipo (podem vir como string do JSON); atualizar_produto (87-90) não repete a validação de tamanho do nome presente em criar_produto (47-50); buscar_produtos converte preco_min/preco_max com float() (118-121) sem tratar exceção de conversão.
+Impact: Entradas inválidas geram 500 em vez de 400, ou são persistidas sem checagem, e abrem mais superfície para os problemas de tipo que alimentam o AP-02.
+Recommendation: Centralizar as regras de validação em um único validador usado por create e update. Ver RP-16.
+
+### #15 [MEDIUM] Generic exception handling and error leakage (AP-16)
+File: controllers.py:10-12, 21-22, 60-62, 95-96, 108-109, 125-126, 133-134, 143-144, 164-165, 185-186, 218-220, 226-227, 234-235, 254-255, 261-262, 291-292; app.py:77-78
+Description: Todas as funções de controllers.py e a rota /admin/query capturam except Exception as e e devolvem str(e) direto no corpo da resposta, repetindo o mesmo bloco try/except em cada handler.
+Impact: Mensagens internas (nome de coluna, caminho de arquivo, mensagem do driver SQLite) vazam para o cliente; não existe diferenciação entre erro de validação e erro interno.
+Recommendation: Centralizar em um error handler único que loga o detalhe e devolve uma mensagem genérica ao cliente. Ver RP-06.
+
+### #16 [MEDIUM] Cross-cutting side effects inside handlers (AP-17)
+File: controllers.py:208-210, 247-250
+Description: criar_pedido dispara três print simulando envio de e-mail/SMS/push (208-210) dentro do próprio handler de criação; atualizar_status_pedido imprime notificações de aprovação/cancelamento (247-250) misturadas com a troca de status.
+Impact: O handler acumula motivos de mudança que não têm relação com "criar pedido"; a notificação não pode ser desligada em teste nem reaproveitada por outro fluxo.
+Recommendation: Mover para um serviço de notificação chamado pelo controller. Ver RP-04 e RP-12.
+
+### #17 [LOW] Magic numbers and inline literal lists (AP-19)
+File: controllers.py:47, 49, 52, 242; models.py:257-262
+Description: Limites de tamanho de nome (47: < 2, 49: > 200), a lista categorias_validas (52) e a lista de status válidos (242) estão escritos inline nos handlers; os percentuais e limites de desconto (10000/0.1, 5000/0.05, 1000/0.02) estão hardcoded em relatorio_vendas (257-262).
+Impact: Mudar uma regra de negócio exige caçar o valor espalhado pelo código; cópias da mesma lista podem divergir.
+Recommendation: Mover para constantes nomeadas na camada de modelo. Ver RP-11.
+
+### #18 [LOW] Poor naming (AP-20)
+File: models.py:187, 191, 219, 223; controllers.py:14, 64, 98
+Description: Cursores numerados cursor2/cursor3 (models.py:187,191,219,223) por falta de escopo próprio; parâmetros de rota nomeados id (controllers.py:14, 64, 98) sombreiam o builtin id do Python.
+Impact: Dificulta leitura e aumenta a chance de reutilizar a variável errada.
+Recommendation: Renomear para nomes de domínio (produto_id, pedido_id) ao extrair as camadas. Ver RP-15.
+
+### #19 [LOW] Dead code and unused imports (AP-21)
+File: models.py:2; database.py:2
+Description: models.py importa sqlite3 (linha 2) mas nunca usa o módulo diretamente (todo acesso passa por database.get_db()); database.py importa os (linha 2) e nunca o referencia no arquivo.
+Impact: Sinaliza dependência que não existe de fato e confunde quem lê o arquivo.
+Recommendation: Remover os imports não utilizados.
+
+### #20 [LOW] Print-based logging (AP-22)
+File: controllers.py:8, 11, 57, 61, 106, 161, 179, 182, 208-210, 219, 248, 250; app.py:56, 83-86
+Description: Toda mensagem operacional (listagem, criação, erro, login, notificações, banner de boot) usa print em vez de um logger configurado.
+Impact: Sem níveis, sem timestamp, sem como silenciar em teste, e dados de usuário (e-mail, id) acabam concatenados direto no stdout.
+Recommendation: Substituir por um logger de módulo padrão. Ver RP-12.
+
+## Deprecated APIs
+| API | File:line | Status | Modern equivalent |
+|-----|-----------|--------|-------------------|
+| — | — | — | — |
+
+Nenhuma API deprecated encontrada para esta stack. Verificado: o projeto usa Python 3.12 + Flask 3.1.1 + sqlite3 cru, sem SQLAlchemy, sem datetime.utcnow()/adapters de data do sqlite3 (o schema usa CURRENT_TIMESTAMP como TEXT, nunca passa datetime do Python para o driver), sem asyncio, sem logging.warn(), sem flask.before_first_request/JSONEncoder/escape, sem werkzeug.urls legado. A importação do app com `python -W error::DeprecationWarning -c "import app"` não emitiu nenhum warning.
+
+## Proposed target structure
+```
+code-smells-project/
+├── app.py
+├── config/
+│   └── __init__.py
+├── database/
+│   └── __init__.py
+├── models/
+│   ├── __init__.py
+│   ├── produto.py
+│   ├── usuario.py
+│   └── pedido.py
+├── controllers/
+│   ├── __init__.py
+│   ├── produto_controller.py
+│   ├── usuario_controller.py
+│   ├── pedido_controller.py
+│   └── sistema_controller.py
+├── routes/
+│   ├── __init__.py
+│   ├── produto_routes.py
+│   ├── usuario_routes.py
+│   ├── pedido_routes.py
+│   └── sistema_routes.py
+├── middlewares/
+│   └── error_handler.py
+├── .env.example
+└── README.md
+```
+
+## Contract decisions preview
+- POST /admin/query será removido do contrato público: executa SQL arbitrário vindo da requisição (AP-06, CRITICAL) e não existe forma segura de preservar esse comportamento.
+- POST /admin/reset-db será mantido como rota, mas passa a exigir um token de administração lido da configuração (ADMIN_TOKEN via variável de ambiente), já que o projeto não possui nenhum sistema de autenticação/sessão para um guard mais sofisticado.
+- GET /usuarios e GET /usuarios/<id> deixam de devolver o campo "senha" (AP-04).
+- GET /health deixa de devolver secret_key e debug (AP-04).
+- Senhas passam a ser armazenadas com hash (werkzeug.security) na criação de usuário e verificadas por hash no login (AP-05); o contrato de entrada/saída dos endpoints não muda, exceto pela remoção do campo "senha" das respostas.
+
+================================
+Total: 20 findings
+================================
+
+
+================================
+PHASE 3: REFACTORING COMPLETE
+================================
+## New Project Structure
+code-smells-project/
+├── app.py
+├── config/
+│   ├── __init__.py
+│   └── settings.py
+├── models/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── produto_model.py
+│   ├── usuario_model.py
+│   ├── pedido_model.py
+│   └── sistema_model.py
+├── controllers/
+│   ├── __init__.py
+│   ├── produto_controller.py
+│   ├── usuario_controller.py
+│   ├── pedido_controller.py
+│   └── sistema_controller.py
+├── routes/
+│   ├── __init__.py
+│   ├── produto_routes.py
+│   ├── usuario_routes.py
+│   ├── pedido_routes.py
+│   └── sistema_routes.py
+├── validators/
+│   ├── __init__.py
+│   ├── produto_validator.py
+│   ├── usuario_validator.py
+│   └── pedido_validator.py
+├── services/
+│   ├── __init__.py
+│   └── notificacao_service.py
+├── middlewares/
+│   ├── __init__.py
+│   ├── error_handler.py
+│   └── auth.py
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+
+## Findings resolved
+#1 [CRITICAL] God file (AP-03) - dividido em models/controllers/routes/validators/services/config/middlewares por entidade. Ver RP-03.
+#2 [CRITICAL] Unprotected dangerous endpoint (AP-06) - /admin/reset-db e /admin/query agora exigem X-Admin-Token (401/503) e /admin/query so aceita SELECT; /admin/reset-db recusa em APP_ENV=production. Ver RP-13.
+#3 [CRITICAL] SQL injection (AP-02) - toda query em models/ agora e parametrizada (?). Ver RP-02.
+#4 [CRITICAL] Plaintext password storage (AP-05) - generate_password_hash/check_password_hash via werkzeug.security; seed reescrita com hash. Ver RP-09.
+#5 [CRITICAL] Hardcoded secret (AP-01) - SECRET_KEY lido de variavel de ambiente em config/settings.py. Ver RP-01.
+#6 [CRITICAL] Sensitive data exposure (AP-04) - campo "senha" removido da serializacao de usuario; /health nao retorna mais secret_key/debug/db_path/ambiente. Ver RP-09.
+#7 [HIGH] Tight coupling / no DI (AP-09) - acesso a dados centralizado nos models, conexao obtida via models/base.py e composition root create_app(). Ver RP-05.
+#8 [HIGH] Global mutable state (AP-08) - conexao escopada por requisicao via flask.g, sem variavel global de modulo. Ver RP-05.
+#9 [HIGH] Fat controllers (AP-07) - rotas finas (routes/), controllers orquestram, validators isolam as regras de entrada. Ver RP-04 e RP-16.
+#10 [HIGH] Missing transaction/integrity (AP-12) - criar_pedido executa em uma unica transacao (`with conn:`); schema ganhou FOREIGN KEY e usuarios.email UNIQUE; PRAGMA foreign_keys=ON em toda conexao. Ver RP-14.
+#11 [HIGH] Insecure runtime defaults (AP-11) - debug/host/porta/CORS lidos da config, com defaults seguros para producao. Ver RP-01 e RP-06.
+#12 [MEDIUM] N+1 queries (AP-13) - get_pedidos_usuario/get_todos_pedidos substituidos por uma unica consulta com LEFT JOIN. Ver RP-08.
+#13 [MEDIUM] Duplicated code (AP-14) - serializadores unicos por entidade (_to_dict/_to_public_dict) e validacao unica reaproveitada por create/update. Ver RP-15.
+#14 [MEDIUM] Missing/inconsistent validation (AP-15) - validators/produto_validator.py unifica criacao e atualizacao (incluindo checagem de tamanho do nome agora tambem na atualizacao) e protege a conversao numerica com try/except. Ver RP-16.
+#15 [MEDIUM] Generic exception handling/leakage (AP-16) - hierarquia AppError/ValidationError/NotFoundError/AuthError + handler central em middlewares/error_handler.py; nenhum str(e) exposto ao cliente. Ver RP-06.
+#16 [MEDIUM] Cross-cutting side effects (AP-17) - notificacoes movidas para services/notificacao_service.py, chamado pelo controller. Ver RP-04 e RP-12.
+#17 [LOW] Magic numbers (AP-19) - CATEGORIAS_VALIDAS, STATUS_VALIDOS e FAIXAS_DESCONTO viraram constantes nomeadas nos models. Ver RP-11.
+#18 [LOW] Poor naming (AP-20) - cursor2/cursor3 eliminados (JOIN unico); parametros renomeados para produto_id/usuario_id/pedido_id. Ver RP-15.
+#19 [LOW] Dead code / unused imports (AP-21) - import sqlite3 e import os nao utilizados removidos junto com os arquivos antigos.
+#20 [LOW] Print-based logging (AP-22) - logging.getLogger(__name__) com logging.basicConfig no composition root; todos os prints substituidos. Ver RP-12.
+
+## Contract decisions
+1. POST /admin/query: execucao de SQL arbitrario removida; aceita somente SELECT e exige header X-Admin-Token (401 se ausente/errado, 503 se ADMIN_TOKEN nao configurado).
+2. POST /admin/reset-db: exige X-Admin-Token (401/503 como acima) e e recusado com 403 quando APP_ENV=production.
+3. GET /usuarios e GET /usuarios/<id>: campo "senha" removido da resposta.
+4. GET /health: campos secret_key, debug, db_path e ambiente removidos (mantidos status, database, counts, versao).
+5. Senhas armazenadas com hash (werkzeug.security); seed re-hasheada, credenciais documentadas continuam autenticando (ex.: admin@loja.com / admin123).
+6. PUT /produtos/<id> passa a validar o tamanho do nome (2-200 caracteres), igual ao POST /produtos - antes a atualizacao nao tinha esse check.
+7. Padronizacao do envelope de erro: toda resposta de erro agora inclui "sucesso": false ao lado de "erro" (algumas respostas originais omitiam essa chave).
+
+## Validation
+  ✓ Application boots without errors (sem warnings de depreciacao ou stack trace no boot)
+  ✓ All endpoints respond (19/19 rotas do baseline testadas; status codes e corpos identicos, exceto pelas decisoes de contrato acima)
+  ✓ Zero anti-patterns remaining (cheat sheet de grep da Fase 2 reexecutado sobre o codigo novo: nenhuma ocorrencia de SQL concatenado, secret hardcoded, debug=True, variavel global, print(), except generico com str(e))
+  ✓ Test suite (n/a - o projeto nao possui suite de testes)
+================================
+
+================================
+EVIDÊNCIAS DE VALIDAÇÃO (RAW)
+================================
+
+--- Boot do servidor ORIGINAL (baseline, porta 5101) ---
+ * Serving Flask app 'app'
+ * Debug mode: on
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5101
+[33mPress CTRL+C to quit[0m
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 659-575-209
+127.0.0.1 - - [03/Oct/2026 13:23:58] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /produtos HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /produtos/busca?q=notebook HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /produtos/busca?categoria=informatica&preco_min=100&preco_max=2000 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /produtos/1 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "[33mGET /produtos/9999 HTTP/1.1[0m" 404 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "[35m[1mPOST /produtos HTTP/1.1[0m" 201 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "PUT /produtos/11 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /usuarios HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "GET /usuarios/1 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "[35m[1mPOST /usuarios HTTP/1.1[0m" 201 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "POST /login HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "[31m[1mPOST /login HTTP/1.1[0m" 401 -
+127.0.0.1 - - [03/Oct/2026 13:24:07] "[35m[1mPOST /pedidos HTTP/1.1[0m" 201 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "GET /pedidos HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "GET /pedidos/usuario/2 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "PUT /pedidos/1/status HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "GET /relatorios/vendas HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "DELETE /produtos/11 HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:08] "POST /admin/query HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:15] "POST /admin/reset-db HTTP/1.1" 200 -
+127.0.0.1 - - [03/Oct/2026 13:24:15] "GET /health HTTP/1.1" 200 -
+
+--- Chamadas curl no servidor ORIGINAL (baseline, porta 5101) ---
+### GET /
+{
+  "endpoints": {
+    "health": "/health",
+    "login": "/login",
+    "pedidos": "/pedidos",
+    "produtos": "/produtos",
+    "relatorios": "/relatorios/vendas",
+    "usuarios": "/usuarios"
+  },
+  "mensagem": "Bem-vindo à API da Loja",
+  "versao": "1.0.0"
+}
+
+HTTP_STATUS:200
+
+### GET /produtos
+{
+  "dados": [
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Notebook potente para jogos",
+      "estoque": 10,
+      "id": 1,
+      "nome": "Notebook Gamer",
+      "preco": 5999.99
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Mouse sem fio ergonômico",
+      "estoque": 50,
+      "id": 2,
+      "nome": "Mouse Wireless",
+      "preco": 89.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Teclado mecânico RGB",
+      "estoque": 30,
+      "id": 3,
+      "nome": "Teclado Mecânico",
+      "preco": 299.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Monitor 27 polegadas 144hz",
+      "estoque": 15,
+      "id": 4,
+      "nome": "Monitor 27''",
+      "preco": 1899.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Headset com microfone",
+      "estoque": 25,
+      "id": 5,
+      "nome": "Headset Gamer",
+      "preco": 199.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "moveis",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Cadeira ergonômica",
+      "estoque": 8,
+      "id": 6,
+      "nome": "Cadeira Gamer",
+      "preco": 1299.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Webcam 1080p",
+      "estoque": 20,
+      "id": 7,
+      "nome": "Webcam HD",
+      "preco": 249.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Hub USB 3.0 7 portas",
+      "estoque": 40,
+      "id": 8,
+      "nome": "Hub USB",
+      "preco": 79.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "SSD NVMe 1TB",
+      "estoque": 35,
+      "id": 9,
+      "nome": "SSD 1TB",
+      "preco": 449.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "vestuario",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Camiseta estampa código",
+      "estoque": 100,
+      "id": 10,
+      "nome": "Camiseta Dev",
+      "preco": 59.9
+    }
+  ],
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /produtos/busca?q=notebook
+{
+  "dados": [
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Notebook potente para jogos",
+      "estoque": 10,
+      "id": 1,
+      "nome": "Notebook Gamer",
+      "preco": 5999.99
+    }
+  ],
+  "sucesso": true,
+  "total": 1
+}
+
+HTTP_STATUS:200
+
+### GET /produtos/busca?categoria=informatica&preco_min=100&preco_max=2000
+{
+  "dados": [
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Teclado mecânico RGB",
+      "estoque": 30,
+      "id": 3,
+      "nome": "Teclado Mecânico",
+      "preco": 299.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Monitor 27 polegadas 144hz",
+      "estoque": 15,
+      "id": 4,
+      "nome": "Monitor 27''",
+      "preco": 1899.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Headset com microfone",
+      "estoque": 25,
+      "id": 5,
+      "nome": "Headset Gamer",
+      "preco": 199.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "Webcam 1080p",
+      "estoque": 20,
+      "id": 7,
+      "nome": "Webcam HD",
+      "preco": 249.9
+    },
+    {
+      "ativo": 1,
+      "categoria": "informatica",
+      "criado_em": "2026-10-03 16:23:58",
+      "descricao": "SSD NVMe 1TB",
+      "estoque": 35,
+      "id": 9,
+      "nome": "SSD 1TB",
+      "preco": 449.9
+    }
+  ],
+  "sucesso": true,
+  "total": 5
+}
+
+HTTP_STATUS:200
+
+### GET /produtos/1
+{
+  "dados": {
+    "ativo": 1,
+    "categoria": "informatica",
+    "criado_em": "2026-10-03 16:23:58",
+    "descricao": "Notebook potente para jogos",
+    "estoque": 10,
+    "id": 1,
+    "nome": "Notebook Gamer",
+    "preco": 5999.99
+  },
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /produtos/9999
+{
+  "erro": "Produto não encontrado",
+  "sucesso": false
+}
+
+HTTP_STATUS:404
+
+### POST /produtos
+{
+  "dados": {
+    "id": 11
+  },
+  "mensagem": "Produto criado",
+  "sucesso": true
+}
+
+HTTP_STATUS:201
+
+### PUT /produtos/11
+{
+  "mensagem": "Produto atualizado",
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /usuarios
+{
+  "dados": [
+    {
+      "criado_em": "2026-10-03 16:23:58",
+      "email": "admin@loja.com",
+      "id": 1,
+      "nome": "Admin",
+      "senha": "admin123",
+      "tipo": "admin"
+    },
+    {
+      "criado_em": "2026-10-03 16:23:58",
+      "email": "joao@email.com",
+      "id": 2,
+      "nome": "João Silva",
+      "senha": "123456",
+      "tipo": "cliente"
+    },
+    {
+      "criado_em": "2026-10-03 16:23:58",
+      "email": "maria@email.com",
+      "id": 3,
+      "nome": "Maria Santos",
+      "senha": "senha123",
+      "tipo": "cliente"
+    }
+  ],
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /usuarios/1
+{
+  "dados": {
+    "criado_em": "2026-10-03 16:23:58",
+    "email": "admin@loja.com",
+    "id": 1,
+    "nome": "Admin",
+    "senha": "admin123",
+    "tipo": "admin"
+  },
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### POST /usuarios
+{
+  "dados": {
+    "id": 4
+  },
+  "sucesso": true
+}
+
+HTTP_STATUS:201
+
+### POST /login
+{
+  "dados": {
+    "email": "admin@loja.com",
+    "id": 1,
+    "nome": "Admin",
+    "tipo": "admin"
+  },
+  "mensagem": "Login OK",
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### POST /login
+{
+  "erro": "Email ou senha inválidos",
+  "sucesso": false
+}
+
+HTTP_STATUS:401
+
+### POST /pedidos
+{
+  "dados": {
+    "pedido_id": 1,
+    "total": 6179.79
+  },
+  "mensagem": "Pedido criado com sucesso",
+  "sucesso": true
+}
+
+HTTP_STATUS:201
+
+### GET /pedidos
+{
+  "dados": [
+    {
+      "criado_em": "2026-10-03 16:24:07",
+      "id": 1,
+      "itens": [
+        {
+          "preco_unitario": 5999.99,
+          "produto_id": 1,
+          "produto_nome": "Notebook Gamer",
+          "quantidade": 1
+        },
+        {
+          "preco_unitario": 89.9,
+          "produto_id": 2,
+          "produto_nome": "Mouse Wireless",
+          "quantidade": 2
+        }
+      ],
+      "status": "pendente",
+      "total": 6179.79,
+      "usuario_id": 2
+    }
+  ],
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /pedidos/usuario/2
+{
+  "dados": [
+    {
+      "criado_em": "2026-10-03 16:24:07",
+      "id": 1,
+      "itens": [
+        {
+          "preco_unitario": 5999.99,
+          "produto_id": 1,
+          "produto_nome": "Notebook Gamer",
+          "quantidade": 1
+        },
+        {
+          "preco_unitario": 89.9,
+          "produto_id": 2,
+          "produto_nome": "Mouse Wireless",
+          "quantidade": 2
+        }
+      ],
+      "status": "pendente",
+      "total": 6179.79,
+      "usuario_id": 2
+    }
+  ],
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### PUT /pedidos/1/status
+{
+  "mensagem": "Status atualizado",
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /relatorios/vendas
+{
+  "dados": {
+    "desconto_aplicavel": 308.99,
+    "faturamento_bruto": 6179.79,
+    "faturamento_liquido": 5870.8,
+    "pedidos_aprovados": 1,
+    "pedidos_cancelados": 0,
+    "pedidos_pendentes": 0,
+    "ticket_medio": 6179.79,
+    "total_pedidos": 1
+  },
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### GET /health
+{
+  "ambiente": "producao",
+  "counts": {
+    "pedidos": 1,
+    "produtos": 11,
+    "usuarios": 4
+  },
+  "database": "connected",
+  "db_path": "loja.db",
+  "debug": true,
+  "secret_key": "minha-chave-super-secreta-123",
+  "status": "ok",
+  "versao": "1.0.0"
+}
+
+HTTP_STATUS:200
+
+### DELETE /produtos/11
+{
+  "mensagem": "Produto deletado",
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### POST /admin/query
+{
+  "dados": [
+    {
+      "total": 10
+    }
+  ],
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+
+### POST /admin/reset-db
+{
+  "mensagem": "Banco de dados resetado",
+  "sucesso": true
+}
+
+HTTP_STATUS:200
+### GET /health (pos reset)
+{
+  "ambiente": "producao",
+  "counts": {
+    "pedidos": 0,
+    "produtos": 0,
+    "usuarios": 0
+  },
+  "database": "connected",
+  "db_path": "loja.db",
+  "debug": true,
+  "secret_key": "minha-chave-super-secreta-123",
+  "status": "ok",
+  "versao": "1.0.0"
+}
+
+HTTP_STATUS:200
+
+--- Boot do servidor REFATORADO (porta 5102, PORT/ADMIN_TOKEN/FLASK_DEBUG via env) ---
+ * Serving Flask app 'app'
+ * Debug mode: off
+2026-10-03 13:33:24,510 INFO werkzeug [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5102
+ * Running on http://192.168.3.11:5102
+2026-10-03 13:33:24,510 INFO werkzeug [33mPress CTRL+C to quit[0m
+2026-10-03 13:33:37,208 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET / HTTP/1.1" 200 -
+2026-10-03 13:33:37,219 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /produtos HTTP/1.1" 200 -
+2026-10-03 13:33:37,230 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /produtos/busca?q=notebook HTTP/1.1" 200 -
+2026-10-03 13:33:37,239 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /produtos/busca?categoria=informatica&preco_min=100&preco_max=2000 HTTP/1.1" 200 -
+2026-10-03 13:33:37,248 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /produtos/1 HTTP/1.1" 200 -
+2026-10-03 13:33:37,256 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[33mGET /produtos/9999 HTTP/1.1[0m" 404 -
+2026-10-03 13:33:37,268 INFO controllers.produto_controller produto criado id=11
+2026-10-03 13:33:37,269 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[35m[1mPOST /produtos HTTP/1.1[0m" 201 -
+2026-10-03 13:33:37,280 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "PUT /produtos/11 HTTP/1.1" 200 -
+2026-10-03 13:33:37,288 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /usuarios HTTP/1.1" 200 -
+2026-10-03 13:33:37,297 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /usuarios/1 HTTP/1.1" 200 -
+2026-10-03 13:33:37,415 INFO controllers.usuario_controller usuario criado email=baseline@teste.com
+2026-10-03 13:33:37,416 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[35m[1mPOST /usuarios HTTP/1.1[0m" 201 -
+2026-10-03 13:33:37,537 INFO controllers.usuario_controller login bem-sucedido email=admin@loja.com
+2026-10-03 13:33:37,538 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "POST /login HTTP/1.1" 200 -
+2026-10-03 13:33:37,655 INFO controllers.usuario_controller login falhou email=admin@loja.com
+2026-10-03 13:33:37,656 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[31m[1mPOST /login HTTP/1.1[0m" 401 -
+2026-10-03 13:33:37,672 INFO services.notificacao_service notificacao email pedido_id=1 usuario_id=2
+2026-10-03 13:33:37,672 INFO services.notificacao_service notificacao sms pedido_id=1
+2026-10-03 13:33:37,672 INFO services.notificacao_service notificacao push pedido_id=1
+2026-10-03 13:33:37,672 INFO controllers.pedido_controller pedido criado id=1 usuario_id=2
+2026-10-03 13:33:37,673 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[35m[1mPOST /pedidos HTTP/1.1[0m" 201 -
+2026-10-03 13:33:37,685 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /pedidos HTTP/1.1" 200 -
+2026-10-03 13:33:37,696 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /pedidos/usuario/2 HTTP/1.1" 200 -
+2026-10-03 13:33:37,707 INFO services.notificacao_service notificacao pedido_id=1 aprovado, preparar envio
+2026-10-03 13:33:37,708 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "PUT /pedidos/1/status HTTP/1.1" 200 -
+2026-10-03 13:33:37,719 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /relatorios/vendas HTTP/1.1" 200 -
+2026-10-03 13:33:37,730 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /health HTTP/1.1" 200 -
+2026-10-03 13:33:37,741 INFO controllers.produto_controller produto deletado id=11
+2026-10-03 13:33:37,742 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "DELETE /produtos/11 HTTP/1.1" 200 -
+2026-10-03 13:33:37,753 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "[31m[1mPOST /admin/query HTTP/1.1[0m" 401 -
+2026-10-03 13:33:37,764 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "POST /admin/query HTTP/1.1" 200 -
+2026-10-03 13:33:37,773 WARNING controllers.sistema_controller banco de dados resetado via /admin/reset-db
+2026-10-03 13:33:37,774 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "POST /admin/reset-db HTTP/1.1" 200 -
+2026-10-03 13:33:37,785 INFO werkzeug 127.0.0.1 - - [03/Oct/2026 13:33:37] "GET /health HTTP/1.1" 200 -
+
+--- Chamadas curl no servidor REFATORADO (porta 5102) ---
+### GET /
+{"endpoints":{"health":"/health","login":"/login","pedidos":"/pedidos","produtos":"/produtos","relatorios":"/relatorios/vendas","usuarios":"/usuarios"},"mensagem":"Bem-vindo à API da Loja","versao":"1.0.0"}
+
+HTTP_STATUS:200
+
+### GET /produtos
+{"dados":[{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Notebook potente para jogos","estoque":10,"id":1,"nome":"Notebook Gamer","preco":5999.99},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Mouse sem fio ergonômico","estoque":50,"id":2,"nome":"Mouse Wireless","preco":89.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Teclado mecânico RGB","estoque":30,"id":3,"nome":"Teclado Mecânico","preco":299.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Monitor 27 polegadas 144hz","estoque":15,"id":4,"nome":"Monitor 27''","preco":1899.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Headset com microfone","estoque":25,"id":5,"nome":"Headset Gamer","preco":199.9},{"ativo":1,"categoria":"moveis","criado_em":"2026-10-03 16:33:24","descricao":"Cadeira ergonômica","estoque":8,"id":6,"nome":"Cadeira Gamer","preco":1299.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Webcam 1080p","estoque":20,"id":7,"nome":"Webcam HD","preco":249.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Hub USB 3.0 7 portas","estoque":40,"id":8,"nome":"Hub USB","preco":79.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"SSD NVMe 1TB","estoque":35,"id":9,"nome":"SSD 1TB","preco":449.9},{"ativo":1,"categoria":"vestuario","criado_em":"2026-10-03 16:33:24","descricao":"Camiseta estampa código","estoque":100,"id":10,"nome":"Camiseta Dev","preco":59.9}],"sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /produtos/busca?q=notebook
+{"dados":[{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Notebook potente para jogos","estoque":10,"id":1,"nome":"Notebook Gamer","preco":5999.99}],"sucesso":true,"total":1}
+
+HTTP_STATUS:200
+
+### GET /produtos/busca?categoria=informatica&preco_min=100&preco_max=2000
+{"dados":[{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Teclado mecânico RGB","estoque":30,"id":3,"nome":"Teclado Mecânico","preco":299.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Monitor 27 polegadas 144hz","estoque":15,"id":4,"nome":"Monitor 27''","preco":1899.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Headset com microfone","estoque":25,"id":5,"nome":"Headset Gamer","preco":199.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Webcam 1080p","estoque":20,"id":7,"nome":"Webcam HD","preco":249.9},{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"SSD NVMe 1TB","estoque":35,"id":9,"nome":"SSD 1TB","preco":449.9}],"sucesso":true,"total":5}
+
+HTTP_STATUS:200
+
+### GET /produtos/1
+{"dados":{"ativo":1,"categoria":"informatica","criado_em":"2026-10-03 16:33:24","descricao":"Notebook potente para jogos","estoque":10,"id":1,"nome":"Notebook Gamer","preco":5999.99},"sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /produtos/9999
+{"erro":"Produto não encontrado","sucesso":false}
+
+HTTP_STATUS:404
+
+### POST /produtos
+{"dados":{"id":11},"mensagem":"Produto criado","sucesso":true}
+
+HTTP_STATUS:201
+
+### PUT /produtos/11
+{"mensagem":"Produto atualizado","sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /usuarios
+{"dados":[{"criado_em":"2026-10-03 16:33:24","email":"admin@loja.com","id":1,"nome":"Admin","tipo":"admin"},{"criado_em":"2026-10-03 16:33:24","email":"joao@email.com","id":2,"nome":"João Silva","tipo":"cliente"},{"criado_em":"2026-10-03 16:33:24","email":"maria@email.com","id":3,"nome":"Maria Santos","tipo":"cliente"}],"sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /usuarios/1
+{"dados":{"criado_em":"2026-10-03 16:33:24","email":"admin@loja.com","id":1,"nome":"Admin","tipo":"admin"},"sucesso":true}
+
+HTTP_STATUS:200
+
+### POST /usuarios
+{"dados":{"id":4},"sucesso":true}
+
+HTTP_STATUS:201
+
+### POST /login
+{"dados":{"email":"admin@loja.com","id":1,"nome":"Admin","tipo":"admin"},"mensagem":"Login OK","sucesso":true}
+
+HTTP_STATUS:200
+
+### POST /login
+{"erro":"Email ou senha inválidos","sucesso":false}
+
+HTTP_STATUS:401
+
+### POST /pedidos
+{"dados":{"pedido_id":1,"total":6179.79},"mensagem":"Pedido criado com sucesso","sucesso":true}
+
+HTTP_STATUS:201
+
+### GET /pedidos
+{"dados":[{"criado_em":"2026-10-03 16:33:37","id":1,"itens":[{"preco_unitario":5999.99,"produto_id":1,"produto_nome":"Notebook Gamer","quantidade":1},{"preco_unitario":89.9,"produto_id":2,"produto_nome":"Mouse Wireless","quantidade":2}],"status":"pendente","total":6179.79,"usuario_id":2}],"sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /pedidos/usuario/2
+{"dados":[{"criado_em":"2026-10-03 16:33:37","id":1,"itens":[{"preco_unitario":5999.99,"produto_id":1,"produto_nome":"Notebook Gamer","quantidade":1},{"preco_unitario":89.9,"produto_id":2,"produto_nome":"Mouse Wireless","quantidade":2}],"status":"pendente","total":6179.79,"usuario_id":2}],"sucesso":true}
+
+HTTP_STATUS:200
+
+### PUT /pedidos/1/status
+{"mensagem":"Status atualizado","sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /relatorios/vendas
+{"dados":{"desconto_aplicavel":308.99,"faturamento_bruto":6179.79,"faturamento_liquido":5870.8,"pedidos_aprovados":1,"pedidos_cancelados":0,"pedidos_pendentes":0,"ticket_medio":6179.79,"total_pedidos":1},"sucesso":true}
+
+HTTP_STATUS:200
+
+### GET /health
+{"counts":{"pedidos":1,"produtos":11,"usuarios":4},"database":"connected","status":"ok","versao":"1.0.0"}
+
+HTTP_STATUS:200
+
+### DELETE /produtos/11
+{"mensagem":"Produto deletado","sucesso":true}
+
+HTTP_STATUS:200
+
+### POST /admin/query (sem token)
+{"erro":"Token administrativo inv\u00e1lido","sucesso":false}
+
+HTTP_STATUS:401
+### POST /admin/query (com token, SELECT)
+{"dados":[{"total":10}],"sucesso":true}
+
+HTTP_STATUS:200
+### POST /admin/reset-db (com token)
+{"mensagem":"Banco de dados resetado","sucesso":true}
+
+HTTP_STATUS:200
+### GET /health (pos reset)
+{"counts":{"pedidos":0,"produtos":0,"usuarios":0},"database":"connected","status":"ok","versao":"1.0.0"}
+
+HTTP_STATUS:200
+
+=== Revalidacao manual apos revisao (2026-10-03, porta 5000, ADMIN_TOKEN=t0ken via env) ===
+Boot (.venv/bin/python app.py):
+ * Serving Flask app 'app'
+ * Debug mode: off
+2026-10-03 13:36:54,455 INFO werkzeug WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.3.11:5000

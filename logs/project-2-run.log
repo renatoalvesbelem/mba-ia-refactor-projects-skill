@@ -1,0 +1,199 @@
+================================
+PHASE 1: PROJECT ANALYSIS
+================================
+Language:      JavaScript (Node.js v20.20.2)
+Framework:     Express ^4.18.2 (4.22.1 resolvido no node_modules)
+Dependencies:  express ^4.18.2, sqlite3 ^5.1.6 (5.1.7 resolvido)
+Domain:        API de LMS/e-commerce de cursos (usuários, cursos, matrículas, pagamentos, logs de auditoria), com fluxo de checkout com pagamento e relatório financeiro administrativo
+Architecture:  Manager / service object — a classe AppManager cria o próprio banco, registra as rotas e implementa toda a lógica de cada handler
+Source files:  3 files analyzed
+DB tables:     users, courses, enrollments, payments, audit_logs (SQLite em memória)
+Entry point:   src/app.js
+Endpoints:     3 routes mapped
+================================
+
+================================
+PHASE 2 GATE
+================================
+Phase 2 complete. Proceed with refactoring (Phase 3)? [y/n]
+Resposta do usuário: y
+
+================================
+PHASE 3: REFACTORING COMPLETE
+================================
+## New Project Structure
+src/
+├── server.js
+├── app.js
+├── errors.js
+├── logger.js
+├── config/
+│   └── index.js
+├── models/
+│   ├── database.js
+│   ├── userModel.js
+│   ├── courseModel.js
+│   ├── enrollmentModel.js
+│   ├── paymentModel.js
+│   └── auditLogModel.js
+├── controllers/
+│   ├── checkoutController.js
+│   ├── financialReportController.js
+│   └── userController.js
+├── routes/
+│   ├── index.js
+│   ├── checkoutRoutes.js
+│   ├── adminRoutes.js
+│   └── userRoutes.js
+├── middlewares/
+│   ├── errorHandler.js
+│   ├── asyncHandler.js
+│   └── auth.js
+├── services/
+│   ├── paymentGateway.js
+│   └── passwordHasher.js
+└── validators/
+    └── checkoutValidator.js
+
+## Findings resolved
+#1 [CRITICAL] God file / God class (AP-03) -> dividido em config/models/controllers/routes/middlewares/services/validators. Ver RP-03.
+#2 [CRITICAL] Hardcoded credentials and secrets (AP-01) -> extraído para src/config/index.js lendo process.env com defaults só de dev; .env.example criado. Ver RP-01.
+#3 [CRITICAL] Plaintext/weak password storage (AP-05) -> src/services/passwordHasher.js (scrypt + salt aleatório via node:crypto); seed re-hasheia a senha do usuário Leonan pelo mesmo caminho. Ver RP-09.
+#4 [CRITICAL] Sensitive data exposure in logs (AP-04) -> log do checkout mascara o cartão (últimos 4 dígitos) e não imprime mais nenhuma chave de gateway. Ver RP-09/RP-12.
+#5 [CRITICAL] Unprotected dangerous endpoint (AP-06) -> middlewares/auth.js (requireAdmin) protege GET /api/admin/financial-report e DELETE /api/users/:id via header X-Admin-Token. Ver RP-13.
+#6 [HIGH] Tight coupling / no DI (AP-09) -> raiz de composição createApp({ db, config }) em src/app.js; server.js monta o banco e injeta. Ver RP-05.
+#7 [HIGH] Business logic inside route handlers (AP-07) -> lógica movida para checkoutController.js; routes/checkoutRoutes.js ficou fino (parse + chamada + resposta). Ver RP-04.
+#8 [HIGH] Global mutable state (AP-08) -> globalCache e totalRevenue removidos por completo; nenhum estado mutável em nível de módulo restante. Ver RP-05.
+#9 [HIGH] Unstructured asynchronous flow (AP-10) -> models/database.js promisifica run/get/all/exec; todos os handlers são async/await com caminho único de retorno. Ver RP-07.
+#10 [HIGH] Missing transaction and data integrity (AP-12) -> schema com FOREIGN KEY ... ON DELETE CASCADE, UNIQUE(email), NOT NULL; enrollmentModel.enrollWithPayment usa BEGIN/COMMIT/ROLLBACK; delete de usuário cascateia para enrollments/payments automaticamente. Ver RP-14.
+#11 [MEDIUM] N+1 queries (AP-13) -> paymentModel.financialReport() substitui os loops aninhados por um único JOIN, agrupado em memória pelo controller. Ver RP-08.
+#12 [MEDIUM] Missing/inconsistent input validation (AP-15) -> validators/checkoutValidator.js centraliza a validação do payload; userController valida que o id seja inteiro positivo. Ver RP-16.
+#13 [MEDIUM] Generic exception handling and error leakage (AP-16) -> errors.js + middlewares/errorHandler.js centralizam o tratamento; asyncHandler propaga rejeições; nenhum err é mais ignorado silenciosamente. Ver RP-06.
+#14 [MEDIUM] Cross-cutting side effects inside handlers (AP-17) -> efeito de cache em console removido; logging estruturado explícito via logger.info dentro do controller. Ver RP-04/RP-12.
+#15 [MEDIUM] Deprecated API usage - callback-only sqlite3 (AP-18) -> encapsulado uma única vez em models/database.js com Promises; nenhum db.run/get/all baseado em callback resta nas camadas de rota/controller. Ver RP-10/RP-07.
+#16 [LOW] Poor naming (AP-20) -> variáveis internas renomeadas (name, email, password, courseId, card em vez de u, e, p, cid, cc); badCrypto/logAndCache substituídos por passwordHasher.hash/logger.info; campos públicos do contrato (usr, eml, pwd, c_id, card) preservados. Ver RP-03/RP-15.
+#17 [LOW] Magic numbers and inline literal lists (AP-19) -> CARD_APPROVED_PREFIX e DEFAULT_PASSWORD nomeados em checkoutController; KEY_LENGTH/SALT_LENGTH nomeados em passwordHasher. Ver RP-11.
+#18 [LOW] Dead code and unused imports (AP-21) -> totalRevenue e globalCache removidos por completo do projeto. Ver RP-15.
+#19 [LOW] Print-based logging (AP-22) -> src/logger.js (logger estruturado com níveis) substitui todo uso de console.log fora do próprio logger. Ver RP-12.
+
+## Contract decisions
+- GET /api/admin/financial-report e DELETE /api/users/:id agora exigem o header X-Admin-Token (igual a ADMIN_TOKEN); sem header ou com token errado: 401; ADMIN_TOKEN não configurado (vazio/null): 503 (validado isoladamente no middleware; no boot padrão o token de dev já vem configurado para não travar o fluxo documentado em api.http).
+- DELETE /api/users/:id agora apaga em cascata (schema) enrollments e payments do usuário, em vez de deixá-los órfãos; a mensagem de sucesso mudou de "Usuário deletado, mas as matrículas e pagamentos ficaram sujos no banco." para "Usuário deletado com sucesso."
+- Senhas de novos usuários passam por scrypt + salt aleatório; o usuário seed Leonan é re-semeado pelo mesmo hashing.
+- O log do checkout deixou de imprimir o cartão completo e a chave do gateway; loga apenas os últimos 4 dígitos do cartão e o status da cobrança.
+- Nenhuma mudança de contrato fora da tabela permitida pelas guidelines foi feita; todos os demais status codes e corpos de resposta (checkout aprovado, checkout recusado, formato do relatório financeiro, validação de campos obrigatórios, curso não encontrado) permanecem idênticos aos da versão original.
+
+## Validation
+  ✓ Application boots without errors (porta 3101, log estruturado, sem warnings)
+  ✓ All endpoints respond (5/5 chamadas de baseline reproduzidas com corpo e status idênticos, mais checagens adicionais de guarda de admin, validação e curso inexistente)
+  ✓ Zero anti-patterns remaining (greps da Fase 2 reexecutados no código novo: nenhuma ocorrência)
+  ✓ Test suite (n/a — o projeto não possui suíte de testes)
+================================
+
+================================
+VALIDATION EVIDENCE: BASELINE (original app, port 3000)
+================================
+--- boot log ---
+Frankenstein LMS rodando na porta 3000...
+Processando cartão 4111222233334444 na chave pk_live_1234567890abcdef
+[LOG] Salvando no cache: last_checkout_2
+Processando cartão 5111222233334444 na chave pk_live_1234567890abcdef
+
+--- curl calls ---
+=== Checkout sucesso (POST /api/checkout) ===
+{"msg":"Sucesso","enrollment_id":2}
+HTTP_STATUS:200
+
+=== Checkout recusado (POST /api/checkout) ===
+Pagamento recusado
+HTTP_STATUS:400
+
+=== Relatorio financeiro (GET /api/admin/financial-report) ===
+[{"course":"Clean Architecture","revenue":997,"students":[{"student":"Leonan","paid":997}]},{"course":"Docker","revenue":497,"students":[{"student":"Guilherme","paid":497}]}]
+HTTP_STATUS:200
+
+=== Deletar usuario (DELETE /api/users/1) ===
+Usuário deletado, mas as matrículas e pagamentos ficaram sujos no banco.
+HTTP_STATUS:200
+
+=== Relatorio financeiro apos delete (para conferir dado orfao) ===
+[{"course":"Docker","revenue":497,"students":[{"student":"Guilherme","paid":497}]},{"course":"Clean Architecture","revenue":997,"students":[{"student":"Unknown","paid":997}]}]
+HTTP_STATUS:200
+
+================================
+VALIDATION EVIDENCE: REFACTORED APP (port 3101)
+================================
+--- boot log ---
+{"level":"info","message":"Frankenstein LMS rodando na porta 3101...","ts":"2026-10-03T16:29:35.694Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"PAID","ts":"2026-10-03T16:29:50.467Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"DENIED","ts":"2026-10-03T16:29:50.531Z"}
+
+--- curl calls (equivalentes ao baseline + guarda de admin) ---
+=== Checkout sucesso (POST /api/checkout) ===
+{"msg":"Sucesso","enrollment_id":2}
+HTTP_STATUS:200
+
+=== Checkout recusado (POST /api/checkout) ===
+Pagamento recusado
+HTTP_STATUS:400
+
+=== Relatorio financeiro SEM token (deve falhar 401) ===
+Token administrativo inválido
+HTTP_STATUS:401
+
+=== Relatorio financeiro COM token ===
+[{"course":"Clean Architecture","revenue":997,"students":[{"student":"Leonan","paid":997}]},{"course":"Docker","revenue":497,"students":[{"student":"Guilherme","paid":497}]}]
+HTTP_STATUS:200
+
+=== Deletar usuario SEM token (deve falhar 401) ===
+Token administrativo inválido
+HTTP_STATUS:401
+
+=== Deletar usuario COM token ===
+Usuário deletado com sucesso.
+HTTP_STATUS:200
+
+=== Relatorio financeiro apos delete (conferir cascade, sem 'Unknown' orfao) ===
+[{"course":"Clean Architecture","revenue":0,"students":[]},{"course":"Docker","revenue":497,"students":[{"student":"Guilherme","paid":497}]}]
+HTTP_STATUS:200
+
+--- curl calls adicionais (curso inexistente, campo obrigatorio ausente, verificacao de log sem dados sensiveis) ---
+=== Checkout com c_id inexistente (404 esperado) ===
+Curso não encontrado
+HTTP_STATUS:404
+
+=== Checkout faltando campo obrigatorio (400 Bad Request esperado) ===
+Bad Request
+HTTP_STATUS:400
+
+=== Log do servidor (deve mascarar cartao, sem chave do gateway) ===
+{"level":"info","message":"Frankenstein LMS rodando na porta 3101...","ts":"2026-10-03T16:29:35.694Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"PAID","ts":"2026-10-03T16:29:50.467Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"DENIED","ts":"2026-10-03T16:29:50.531Z"}
+
+================================
+VALIDATION EVIDENCE: guarda de admin sem ADMIN_TOKEN configurado
+================================
+--- tentativa via processo real na porta 3102 (ADMIN_TOKEN='' cai no default seguro de dev, por isso 401, nao 503) ---
+--- teste 503 quando ADMIN_TOKEN vazio ---
+Token administrativo inválido
+HTTP_STATUS:401
+
+--- teste isolado do middleware com config.adminToken=null (simulando ADMIN_TOKEN realmente ausente) ---
+ADMIN_TOKEN ausente (config.adminToken=null) -> status 503 | body: Endpoint administrativo desabilitado: configure ADMIN_TOKEN
+
+=== Revalidacao manual apos revisao (2026-10-03, porta 3000, NODE_ENV=development) ===
+
+> desafio-arquitetura-ia-boilerplate@1.0.0 start
+> node src/server.js
+
+{"level":"info","message":"Frankenstein LMS rodando na porta 3000...","ts":"2026-10-03T16:33:35.476Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"PAID","ts":"2026-10-03T16:33:37.244Z"}
+{"level":"info","message":"checkout payment attempt","card":"****4444","status":"DENIED","ts":"2026-10-03T16:33:37.302Z"}
+POST /api/checkout (Guilherme, cartao 4111...) -> 200 {"msg":"Sucesso","enrollment_id":2}
+POST /api/checkout (Joao, cartao 5111...) -> 400 Pagamento recusado
+GET /api/admin/financial-report sem token -> 401 Token administrativo invalido
+GET /api/admin/financial-report com X-Admin-Token -> 200 [{"course":"Clean Architecture","revenue":997,"students":[{"student":"Leonan","paid":997}]},{"course":"Docker","revenue":497,"students":[{"student":"Guilherme","paid":497}]}]
+DELETE /api/users/1 com X-Admin-Token -> 200 Usuario deletado com sucesso.
+GET /api/admin/financial-report apos delete -> 200 (Clean Architecture sem alunos, revenue 0; matricula e pagamento removidos em cascata)
+POST /api/checkout {} -> 400 Bad Request
